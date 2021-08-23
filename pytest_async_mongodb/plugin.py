@@ -6,6 +6,12 @@ import codecs
 import types
 
 import mongomock
+from mongomock.results import DeleteResult
+from mongomock import helpers
+try:
+    from collections.abc import Mapping
+except ImportError:
+    from collections import Mapping
 import pytest
 import yaml
 from bson import json_util
@@ -57,15 +63,18 @@ class AsyncCollection(AsyncClassMethod, mongomock.Collection):
         'find_one',
         'find',
         'count',
+        'insert_one',
+        'update_one',
+        '_delete'
     ]
 
     async def find_one(self, filter=None, *args, **kwargs):
-        import collections
+
         # Allow calling find_one with a non-dict argument that gets used as
         # the id for the query.
         if filter is None:
             filter = {}
-        if not isinstance(filter, collections.Mapping):
+        if not isinstance(filter, Mapping):
             filter = {'_id': filter}
 
         cursor = await self.find(filter, *args, **kwargs)
@@ -73,9 +82,56 @@ class AsyncCollection(AsyncClassMethod, mongomock.Collection):
             return next(cursor)
         except StopIteration:
             return None
+    
+    async def delete_one(self, filter, collation=None, hint=None, session=None):
+        result = await self._delete(filter, collation=collation, hint=hint, session=session)
+        return DeleteResult(result, True)
+
+    async def _delete(self, filter, collation=None, hint=None, multi=False, session=None):
+        if hint:
+            raise NotImplementedError(
+                'The hint argument of delete is valid but has not been implemented in '
+                'mongomock yet')
+        if collation:
+            raise NotImplementedError(
+                'collation',
+                'The collation argument of delete is valid but has not been '
+                'implemented in mongomock yet')
+        if session:
+            NotImplementedError('session', 'Mongomock does not handle sessions yet')
+        filter = helpers.patch_datetime_awareness_in_document(filter)
+        if filter is None:
+            filter = {}
+        if not isinstance(filter, Mapping):
+            filter = {'_id': filter}
+
+        to_delete = list(await self.find(filter))
+
+        deleted_count = 0
+        for doc in to_delete:
+            doc_id = doc['_id']
+            if isinstance(doc_id, dict):
+                doc_id = helpers.hashdict(doc_id)
+            del self._store[doc_id]
+            deleted_count += 1
+            if not multi:
+                break
+
+        return {
+            'connectionId': self.database.client._id,
+            'n': deleted_count,
+            'ok': 1.0,
+            'err': None,
+        }
 
 
 class AsyncDatabase(AsyncClassMethod, mongomock.Database):
+
+    def __init__(self, client, name):
+        self._collections = {}
+        super().__init__(client, name, None)
+        
+
 
     ASYNC_METHODS = [
         'collection_names'
@@ -85,14 +141,17 @@ class AsyncDatabase(AsyncClassMethod, mongomock.Database):
                        write_concern=None):
         collection = self._collections.get(name)
         if collection is None:
-            collection = self._collections[name] = AsyncCollection(self, name)
+            collection = self._collections[name] = AsyncCollection(self, name, self._store)
         return collection
 
 
 class AsyncMockMongoClient(mongomock.MongoClient):
-
+    def __init__(self):
+        self._databases = {}
+        pass
     def get_database(self, name, codec_options=None, read_preference=None,
                      write_concern=None):
+    
         db = self._databases.get(name)
         if db is None:
             db = self._databases[name] = AsyncDatabase(self, name)
@@ -100,26 +159,39 @@ class AsyncMockMongoClient(mongomock.MongoClient):
 
 
 @pytest.fixture(scope='function')
-async def async_mongodb(pytestconfig):
+async def async_mongodb(pytestconfig, request):
+    marker = request.node.get_closest_marker("collections")
+    not_drop_exists = request.node.get_closest_marker("not_drop_exists")
+    if marker is None:
+        data = None
+    else:
+        v = marker.args[0]
+        if isinstance(v, list):
+            data = set(list(v))
+        else:
+            data = v
     client = AsyncMockMongoClient()
     db = client['pytest']
-    await clean_database(db)
-    load_fixtures(db, pytestconfig)
+    if not_drop_exists is None:
+        await clean_database(db)
+    await load_fixtures(db, pytestconfig, data)
     return db
 
 
 async def clean_database(db):
-    collections = await db.collection_names(include_system_collections=False)
+    collections = db.list_collection_names()
     for name in collections:
         db.drop_collection(name)
 
 
-def load_fixtures(db, config):
+async def load_fixtures(db, config, collections):
+    if collections is None:
+        return
     option_dir = config.getoption('async_mongodb_fixture_dir')
     ini_dir = config.getini('async_mongodb_fixture_dir')
-    fixtures = config.getini('async_mongodb_fixtures')
+    fixtures = collections
     basedir = option_dir or ini_dir
-
+    
     for file_name in os.listdir(basedir):
         collection, ext = os.path.splitext(os.path.basename(file_name))
         file_format = ext.strip('.')
@@ -127,10 +199,12 @@ def load_fixtures(db, config):
         selected = fixtures and collection in fixtures
         if selected and supported:
             path = os.path.join(basedir, file_name)
-            load_fixture(db, collection, path, file_format)
+            if collection not in db.list_collection_names():
+                await load_fixture(db, collection, path, file_format)
 
 
-def load_fixture(db, collection, path, file_format):
+async def load_fixture(db, collection, path, file_format):
+    
     if file_format == 'json':
         loader = functools.partial(json.load, object_hook=json_util.object_hook)
     elif file_format == 'yaml':
@@ -141,7 +215,8 @@ def load_fixture(db, collection, path, file_format):
         docs = _cache[path]
     except KeyError:
         with codecs.open(path, encoding='utf-8') as fp:
-            _cache[path] = docs = loader(fp)
+            s =loader(fp)
+            _cache[path] = docs = s
 
     for document in docs:
-        db[collection].insert(document)
+        await db[collection].insert_one(document)
